@@ -17,17 +17,32 @@ import { SileroVAD, encodeWav, FRAME_SAMPLES } from "./vad";
 
 const { upgradeWebSocket, websocket } = createBunWebSocket();
 
+const TTS_BACKEND = (process.env.TTS_BACKEND ?? "cartesia") as "cartesia" | "supertonic";
 const CARTESIA_API_KEY = process.env.CARTESIA_API_KEY ?? "";
+// Supertonic local sidecar (supertonic serve) — native /v1/tts endpoint lets us
+// pass `steps` (the OpenAI-compatible /v1/audio/speech does not).
+const SUPERTONIC_URL = process.env.SUPERTONIC_URL ?? "http://127.0.0.1:7788";
+const SUPERTONIC_VOICE = process.env.SUPERTONIC_VOICE ?? "M5";
+const SUPERTONIC_STEPS = Number(process.env.SUPERTONIC_STEPS ?? 5);
 const LLAMA_URL = process.env.LLAMA_URL ?? "http://0.0.0.0:8001";
-const LLAMA_MODEL = process.env.LLAMA_MODEL ?? "unsloth/gemma-4-E4B-it-GGUF:Q4_K_M";
+const LLAMA_MODEL = process.env.LLAMA_MODEL ?? "zork-best";
+const LLAMA_API_KEY = process.env.LLAMA_API_KEY ?? "";  // optional; llama-server may require it
+// When true, the system prompt asks Gemma to prefix each reply with
+// `[heard: <transcript>]` so you can see what it thinks you said. The tag is
+// stripped before TTS and before storing in session history. See parseNarration().
+const DEBUG_TRANSCRIPT = /^(1|true|yes)$/.test(process.env.DEBUG_TRANSCRIPT ?? "");
+// When set to a directory ("1" means "debug/"), each utterance WAV that reaches
+// the LLM is written to disk so you can hear exactly what Gemma hears. Use to
+// diagnose mic capture / sample-rate / VAD-truncation issues.
+const DEBUG_AUDIO = (process.env.DEBUG_AUDIO ?? "").replace(/^1$/, "debug");
 // "Theo - Modern Narrator" — steady, enunciating narrator voice, fits a DM.
 const VOICE_ID = process.env.CARTESIA_VOICE_ID ?? "79f8b5fb-2cc8-479a-80df-29f7a7cf1a3e";
 const CARTESIA_MODEL = process.env.CARTESIA_MODEL ?? "sonic-3.5";   // latest Sonic
 const CARTESIA_VERSION = process.env.CARTESIA_VERSION ?? "2026-03-01"; // latest API version
 const PORT = Number(process.env.PORT ?? 3000);
 
-if (!CARTESIA_API_KEY) {
-  console.error("Set CARTESIA_API_KEY before starting.");
+if (TTS_BACKEND === "cartesia" && !CARTESIA_API_KEY) {
+  console.error("Set CARTESIA_API_KEY before starting (or use TTS_BACKEND=supertonic).");
   process.exit(1);
 }
 
@@ -46,6 +61,14 @@ Voice and rules:
 
 The adventure opens at "West of House". On the first turn, set that scene.`;
 
+// Debug variant: same narrator, but echo a transcript of the player's heard
+// command as a `[heard: ...]` tag on its own first line, stripped before use.
+const ZORK_SYSTEM_DEBUG = ZORK_SYSTEM + `
+
+DEBUG MODE: Begin every reply with one line exactly of the form \`[heard: <transcript>]\` — your best guess at what the player said aloud, lowercased, brief. Then a newline, then your narration as normal. If you cannot make out the audio at all, write \`[heard: ???]\`.`;
+
+const SYS_PROMPT = DEBUG_TRANSCRIPT ? ZORK_SYSTEM_DEBUG : ZORK_SYSTEM;
+
 type Msg = { role: "system" | "user" | "assistant"; content: any };
 const sessions = new Map<string, Msg[]>();
 const MAX_SESSIONS = 200; // bound memory if this is exposed publicly
@@ -54,28 +77,46 @@ const MAX_HISTORY = 60;   // messages kept per session (besides the system promp
 function freshSession(id: string): Msg[] {
   // simple LRU-ish eviction: Map preserves insertion order, drop the oldest
   while (sessions.size >= MAX_SESSIONS) sessions.delete(sessions.keys().next().value);
-  const h: Msg[] = [{ role: "system", content: ZORK_SYSTEM }];
+  const h: Msg[] = [{ role: "system", content: SYS_PROMPT }];
   sessions.set(id, h);
   return h;
+}
+
+// Split a debug-tagged reply into the heard transcript and the clean narration.
+// Fallback: no tag -> whole string is narration, heard unknown. The tag is
+// expected on the first line; anything after the first newline is narration.
+function parseNarration(raw: string): { heard: string | undefined; text: string } {
+  const m = raw.match(/^\[heard:\s*([^\]]*)\]\s*[\r\n]+([\s\S]*)/);
+  if (!m) return { heard: undefined, text: raw };
+  return { heard: m[1].trim() || "???", text: m[2].trim() };
 }
 function getSession(id: string): Msg[] {
   return sessions.get(id) ?? freshSession(id);
 }
 
 // Run the current session history through Gemma, store + return the narration.
-async function narrate(history: Msg[]): Promise<string> {
+async function narrate(history: Msg[]): Promise<{ heard: string | undefined; text: string }> {
   // keep the system prompt + the most recent turns so context can't grow forever
   if (history.length > MAX_HISTORY + 1) history.splice(1, history.length - (MAX_HISTORY + 1));
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  if (LLAMA_API_KEY) headers["Authorization"] = `Bearer ${LLAMA_API_KEY}`;
   const r = await fetch(`${LLAMA_URL}/v1/chat/completions`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ model: LLAMA_MODEL, messages: history, temperature: 0.8, max_tokens: 320 }),
+    headers,
+    // Gemma 3 it models emit chain-of-thought in `reasoning_content`; disable it
+    // so the narration budget goes to `content` (and latency stays low).
+    body: JSON.stringify({
+      model: LLAMA_MODEL, messages: history, temperature: 0.8, max_tokens: 320,
+      chat_template_kwargs: { enable_thinking: false },
+    }),
   });
   if (!r.ok) throw new Error(`llama-server ${r.status}: ${await r.text()}`);
   const data = await r.json();
-  const text: string = data.choices?.[0]?.message?.content?.trim() ?? "";
-  history.push({ role: "assistant", content: text });
-  return text;
+  const raw: string = data.choices?.[0]?.message?.content?.trim() ?? "";
+  const { heard, text } = DEBUG_TRANSCRIPT ? parseNarration(raw) : { heard: undefined as string | undefined, text: raw };
+  history.push({ role: "assistant", content: text });  // store clean narration, not the debug tag
+  if (heard !== undefined) console.log(`[heard] ${heard}`);
+  return { heard, text };
 }
 
 const app = new Hono();
@@ -85,7 +126,8 @@ app.post("/api/start", async (c) => {
   const history = freshSession(sessionId);
   history.push({ role: "user", content: "Begin the adventure." });
   try {
-    return c.json({ text: await narrate(history) });
+    const { text } = await narrate(history);
+    return c.json({ text });
   } catch (e: any) {
     return c.json({ error: String(e.message ?? e) }, 502);
   }
@@ -97,7 +139,8 @@ app.post("/api/type", async (c) => {
   const history = getSession(sessionId);
   history.push({ role: "user", content: command });
   try {
-    return c.json({ text: await narrate(history) });
+    const { text } = await narrate(history);
+    return c.json({ text });
   } catch (e: any) {
     return c.json({ error: String(e.message ?? e) }, 502);
   }
@@ -105,9 +148,28 @@ app.post("/api/type", async (c) => {
 
 app.post("/api/tts", async (c) => {
   const { text } = await c.req.json<{ text: string }>();
-  // cap length so a public endpoint can't run up the Cartesia bill per call
+  // cap length so a public endpoint can't run up a bill or stall a local synth
   const speakable = (text ?? "").replace(/[*_#`>]/g, "").trim().slice(0, 800);
   if (!speakable) return c.text("empty", 400);
+
+  if (TTS_BACKEND === "supertonic") {
+    // Local supertonic sidecar (supertonic serve). Buffers the whole clip — no
+    // streaming — but at steps=5 short replies land in ~500ms warm.
+    const r = await fetch(`${SUPERTONIC_URL}/v1/tts`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        text: speakable,
+        voice: SUPERTONIC_VOICE,
+        lang: "en",
+        steps: SUPERTONIC_STEPS,
+        response_format: "wav",
+      }),
+    });
+    if (!r.ok) return c.text(`supertonic ${r.status}: ${await r.text()}`, 502);
+    return new Response(r.body, { headers: { "Content-Type": "audio/wav" } });
+  }
+
   const r = await fetch("https://api.cartesia.ai/tts/bytes", {
     method: "POST",
     headers: {
@@ -160,10 +222,18 @@ app.get("/ws", upgradeWebSocket(() => {
 
   async function handleUtterance(audio: Float32Array) {
     try {
-      const b64 = Buffer.from(encodeWav(audio)).toString("base64");
+      const wav = encodeWav(audio);
+      if (DEBUG_AUDIO) {
+        const path = `${DEBUG_AUDIO}/utt_${Date.now()}.wav`;
+        Bun.write(path, wav)
+          .then(() => console.log(`[debug-audio] wrote ${path} (${(audio.length / 16000).toFixed(2)}s)`))
+          .catch((e) => console.warn(`[debug-audio] write failed: ${e.message}`));
+      }
+      const b64 = Buffer.from(wav).toString("base64");
       const history = getSession(sessionId);
       history.push({ role: "user", content: [{ type: "input_audio", input_audio: { data: b64, format: "wav" } }] });
-      send({ type: "narration", text: await narrate(history) });
+      const { heard, text } = await narrate(history);
+      send({ type: "narration", text, ...(heard !== undefined && { heard }) });
     } catch (e: any) {
       busy = false;                 // let the player try again
       send({ type: "error", message: String(e.message ?? e) });
@@ -177,7 +247,11 @@ app.get("/ws", upgradeWebSocket(() => {
       const d = e.data;
       if (typeof d === "string") {
         const m = JSON.parse(d);
-        if (m.type === "hello") sessionId = m.sessionId;
+        if (m.type === "hello") {
+          sessionId = m.sessionId;
+          if (m.sampleRate && m.sampleRate !== 16000)
+            console.warn(`[mic] client AudioContext at ${m.sampleRate} Hz (expected 16000) — audio will be mis-pitched!`);
+        }
         else if (m.type === "resume") { busy = false; queue.length = 0; leftover = new Float32Array(0); vad?.reset(); }
         return;
       }

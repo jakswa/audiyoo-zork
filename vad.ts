@@ -8,6 +8,10 @@ import * as ort from "onnxruntime-node";
 
 export const SAMPLE_RATE = 16000;
 export const FRAME_SAMPLES = 512;
+// Silero v5 wants each frame prepended with the last 64 samples of the previous
+// frame (model input is [1, 576] at 16kHz, like the official wrapper). Feeding a
+// bare [1, 512] "works" but probabilities collapse mid-speech, ending turns early.
+const CONTEXT_SAMPLES = 64;
 
 export interface VADOptions {
   positiveSpeechThreshold: number; // enter "speaking" at/above this prob
@@ -21,7 +25,7 @@ export interface VADOptions {
 export const DEFAULTS: VADOptions = {
   positiveSpeechThreshold: 0.5,
   negativeSpeechThreshold: 0.35,
-  redemptionFrames: 8,      // ~256ms of quiet ends the turn
+  redemptionFrames: 15,     // ~480ms of quiet ends the turn
   minSpeechFrames: 3,       // ~96ms minimum, filters clicks/coughs
   preSpeechPadFrames: 3,    // ~96ms of lead-in so onsets aren't clipped
   maxSpeechFrames: 1500,    // ~48s hard cap on a single utterance
@@ -46,6 +50,7 @@ export class SileroVAD {
 
   private speaking = false;
   private redemption = 0;
+  private context = new Float32Array(CONTEXT_SAMPLES); // tail of the previous frame
   private speechFrames: Float32Array[] = []; // frames kept for the current utterance
   private preRoll: Float32Array[] = [];       // ring buffer of recent pre-speech frames
 
@@ -59,11 +64,13 @@ export class SileroVAD {
   }
 
   private async prob(frame: Float32Array): Promise<number> {
-    // ort reads from the underlying buffer start and ignores byteOffset, so a
-    // subarray/view would silently feed the wrong samples. Pass a clean copy
-    // whenever the frame isn't already a standalone, exact-length buffer.
-    const clean = frame.byteOffset === 0 && frame.length === FRAME_SAMPLES ? frame : frame.slice();
-    const input = new ort.Tensor("float32", clean, [1, FRAME_SAMPLES]);
+    // Build the [context ++ frame] input the v5 model expects. Copying into a
+    // fresh buffer also sidesteps ort's byteOffset-ignoring tensor reads.
+    const data = new Float32Array(CONTEXT_SAMPLES + FRAME_SAMPLES);
+    data.set(this.context);
+    data.set(frame, CONTEXT_SAMPLES);
+    this.context.set(frame.subarray(FRAME_SAMPLES - CONTEXT_SAMPLES));
+    const input = new ort.Tensor("float32", data, [1, CONTEXT_SAMPLES + FRAME_SAMPLES]);
     const state = new ort.Tensor("float32", this.state, [2, 1, 128]);
     const out = await this.session.run({ input, state, sr: this.sr });
     // onnxruntime-node reuses the output buffer on the next run(), so we must
@@ -76,6 +83,7 @@ export class SileroVAD {
   /** Reset to a clean listening state (fresh LSTM state, no in-progress utterance). */
   reset() {
     this.state = new Float32Array(2 * 1 * 128);
+    this.context = new Float32Array(CONTEXT_SAMPLES);
     this.speaking = false;
     this.redemption = 0;
     this.speechFrames = [];

@@ -244,12 +244,12 @@ registerProcessor('pcm', PCM);`;
 async function startVoice() {
   ws = new WebSocket((location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws");
   ws.binaryType = "arraybuffer";
-  ws.onopen = () => ws.send(JSON.stringify({ type: "hello", sessionId }));
+  ws.onopen = () => ws.send(JSON.stringify({ type: "hello", sessionId, sampleRate: micCtx?.sampleRate }));
   ws.onmessage = (e) => {
     const m = JSON.parse(e.data);
     if (m.type === "speech_start") { if (state === "listening") setState("hearing"); }
     else if (m.type === "thinking") { setLive(false); setState("thinking"); }
-    else if (m.type === "narration") dungeonTurn(m.text);
+    else if (m.type === "narration") { if (m.heard) console.log("%c[heard] " + m.heard, "color:#9cf"); dungeonTurn(m.text); }
     else if (m.type === "error") console.warn("[server]", m.message);
   };
   ws.onclose = () => { if (state !== "boot") setState("boot"), (stateEl.textContent = "disconnected — reload"); };
@@ -257,7 +257,10 @@ async function startVoice() {
   micCtx = new AudioContext({ sampleRate: 16000 });
   if (micCtx.sampleRate !== 16000) console.warn("mic context at", micCtx.sampleRate, "Hz, expected 16000");
   ttsCtx = new AudioContext();
-  micStream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1 } });
+  // Browser DSP (autoGainControl/noiseSuppression) was pumping the signal to
+  // 3-10x normal speech RMS, garbling it for Gemma. Keep echoCancellation (needed
+  // so TTS playback doesn't loop back into the mic); drop the rest.
+  micStream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: false, autoGainControl: false, channelCount: 1 } });
   const src = micCtx.createMediaStreamSource(micStream);
   micAnalyser = micCtx.createAnalyser(); micAnalyser.fftSize = 1024; src.connect(micAnalyser);
   ttsAnalyser = ttsCtx.createAnalyser(); ttsAnalyser.fftSize = 1024;

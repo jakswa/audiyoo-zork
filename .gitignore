@@ -2,3 +2,6 @@ node_modules/
 .env
 *.log
 tests/seg_*.wav
+debug/
+vad_trace.csv
+seg_*.wav
