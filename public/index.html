@@ -257,10 +257,11 @@ async function startVoice() {
   micCtx = new AudioContext({ sampleRate: 16000 });
   if (micCtx.sampleRate !== 16000) console.warn("mic context at", micCtx.sampleRate, "Hz, expected 16000");
   ttsCtx = new AudioContext();
-  // Browser DSP (autoGainControl/noiseSuppression) was pumping the signal to
-  // 3-10x normal speech RMS, garbling it for Gemma. Keep echoCancellation (needed
-  // so TTS playback doesn't loop back into the mic); drop the rest.
-  micStream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: false, autoGainControl: false, channelCount: 1 } });
+  // autoGainControl was pumping the signal to 3-10x normal speech RMS, garbling
+  // it for Gemma — keep it off. echoCancellation stays on so TTS playback
+  // doesn't loop back into the mic; noiseSuppression helps Silero ignore
+  // room noise and doesn't touch gain.
+  micStream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: false, channelCount: 1 } });
   const src = micCtx.createMediaStreamSource(micStream);
   micAnalyser = micCtx.createAnalyser(); micAnalyser.fftSize = 1024; src.connect(micAnalyser);
   ttsAnalyser = ttsCtx.createAnalyser(); ttsAnalyser.fftSize = 1024;
