@@ -17,13 +17,20 @@ import { SileroVAD, encodeWav, FRAME_SAMPLES } from "./vad";
 
 const { upgradeWebSocket, websocket } = createBunWebSocket();
 
-const TTS_BACKEND = (process.env.TTS_BACKEND ?? "supertonic") as "cartesia" | "supertonic";
+const TTS_BACKEND = (process.env.TTS_BACKEND ?? "supertonic") as "cartesia" | "supertonic" | "kokoro";
 const CARTESIA_API_KEY = process.env.CARTESIA_API_KEY ?? "";
 // Supertonic local sidecar (supertonic serve) — native /v1/tts endpoint lets us
 // pass `steps` (the OpenAI-compatible /v1/audio/speech does not).
 const SUPERTONIC_URL = process.env.SUPERTONIC_URL ?? "http://127.0.0.1:7788";
 const SUPERTONIC_VOICE = process.env.SUPERTONIC_VOICE ?? "M5";
 const SUPERTONIC_STEPS = Number(process.env.SUPERTONIC_STEPS ?? 5);
+// Kokoro-82M local GPU sidecar (kokoro_sidecar.py, 7900XT/ROCm). Persistent +
+// pre-warmed, ~200ms per utterance at RTF ~0.04. Default voice `am_onyx,am_michael`
+// blends depth + clarity at speed 0.9 for DM gravitas — audition in
+// kokoro_test/out/audition/.
+const KOKORO_URL = process.env.KOKORO_URL ?? "http://127.0.0.1:7100";
+const KOKORO_VOICE = process.env.KOKORO_VOICE ?? "am_onyx,am_michael";
+const KOKORO_SPEED = Number(process.env.KOKORO_SPEED ?? "0.9");  // <1 = slower, more DM-like
 const LLAMA_URL = process.env.LLAMA_URL ?? "http://0.0.0.0:8001";
 const LLAMA_MODEL = process.env.LLAMA_MODEL ?? "zork-best";
 const LLAMA_API_KEY = process.env.LLAMA_API_KEY ?? "";  // optional; llama-server may require it
@@ -151,6 +158,19 @@ app.post("/api/tts", async (c) => {
   // cap length so a public endpoint can't run up a bill or stall a local synth
   const speakable = (text ?? "").replace(/[*_#`>]/g, "").trim().slice(0, 800);
   if (!speakable) return c.text("empty", 400);
+
+  if (TTS_BACKEND === "kokoro") {
+    // Local Kokoro-82M GPU sidecar (kokoro_sidecar.py). One forward pass, no
+    // streaming, but RTF ~0.04 so a 5s reply lands in ~200ms warm — comfortably
+    // under conversational latency. Voice is configurable per-request.
+    const r = await fetch(`${KOKORO_URL}/tts`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text: speakable, voice: KOKORO_VOICE, speed: KOKORO_SPEED }),
+    });
+    if (!r.ok) return c.text(`kokoro ${r.status}: ${await r.text()}`, 502);
+    return new Response(r.body, { headers: { "Content-Type": "audio/wav" } });
+  }
 
   if (TTS_BACKEND === "supertonic") {
     // Local supertonic sidecar (supertonic serve). Buffers the whole clip — no

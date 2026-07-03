@@ -5,3 +5,11 @@ tests/seg_*.wav
 debug/
 vad_trace.csv
 seg_*.wav
+
+# local TTS experiments — only the kokoro sidecar ships; model blobs, benchmark
+# scripts, and generated audio stay local (KOKORO_REQS.md is the local runbook,
+# distilled into README "Local GPU TTS")
+kokoro_test/*
+!kokoro_test/kokoro_sidecar.py
+supertonic_test/
+KOKORO_REQS.md
