@@ -19,8 +19,10 @@ Open it in **Chrome/Edge**, click *enter the underground*, and talk.
 **Prerequisites**
 - [Bun](https://bun.sh)
 - A running `llama-server` on `:8001` serving a **multimodal** Gemma
-  (`unsloth/gemma-4-E4B-it-GGUF:Q4_K_M`), reachable at `LLAMA_URL`.
-- A [Cartesia](https://cartesia.ai) API key.
+  (e.g. `unsloth/gemma-4-E4B-it-GGUF:Q4_K_M`), reachable at `LLAMA_URL`.
+- A [Cartesia](https://cartesia.ai) API key — **or** a local
+  [supertonic](https://pypi.org/project/supertonic/) sidecar with
+  `TTS_BACKEND=supertonic` (see Configuration).
 - `ffmpeg` is **only** needed to run the tests, not the server.
 
 ## How it works
@@ -34,7 +36,7 @@ Open it in **Chrome/Edge**, click *enter the underground*, and talk.
     ├───────────────────────────────▶ llama-server :8001  (Gemma hears the wav)
     │   {type:"narration",text} ◀──────────────── narration
     ▼
- browser plays it via POST /api/tts → Cartesia (sonic-2)
+ browser plays it via POST /api/tts → Cartesia (or local supertonic)
 ```
 
 Server-side VAD (not browser-side) was chosen so the tricky segmentation logic is
@@ -53,13 +55,34 @@ Server-side VAD (not browser-side) was chosen so the tricky segmentation logic i
 
 | Var | Default | Notes |
 |---|---|---|
-| `CARTESIA_API_KEY` | — | **required** |
+| `TTS_BACKEND` | `cartesia` | `cartesia` or `supertonic` (local sidecar, see below) |
+| `CARTESIA_API_KEY` | — | **required** unless `TTS_BACKEND=supertonic` |
 | `CARTESIA_VOICE_ID` | `79f8b5fb-…` (Theo – Modern Narrator) | `curl -H "X-API-Key: $KEY" -H "Cartesia-Version: 2026-03-01" https://api.cartesia.ai/voices` |
 | `CARTESIA_MODEL` | `sonic-3.5` | latest Sonic model |
 | `CARTESIA_VERSION` | `2026-03-01` | Cartesia API version header |
+| `SUPERTONIC_URL` | `http://127.0.0.1:7788` | supertonic sidecar base URL |
+| `SUPERTONIC_VOICE` | `M5` | |
+| `SUPERTONIC_STEPS` | `5` | diffusion steps; more = better/slower |
 | `LLAMA_URL` | `http://0.0.0.0:8001` | |
-| `LLAMA_MODEL` | `unsloth/gemma-4-E4B-it-GGUF:Q4_K_M` | |
+| `LLAMA_MODEL` | `zork-best` | model name/alias your llama-server exposes |
+| `LLAMA_API_KEY` | — | sent as `Authorization: Bearer` if set |
 | `PORT` | `3000` | |
+| `DEBUG_TRANSCRIPT` | off | `1` = Gemma prefixes `[heard: …]` (logged + sent to client, stripped from TTS/history) |
+| `DEBUG_AUDIO` | off | `1` (= `debug/`) or a dir: dump each utterance WAV the LLM hears |
+
+### Local TTS: the supertonic sidecar
+
+`TTS_BACKEND=supertonic` expects a [supertonic](https://pypi.org/project/supertonic/)
+server running at `SUPERTONIC_URL`. **The deployer must start it** alongside
+`bun start` — it is not spawned automatically:
+
+```sh
+uv run --with 'supertonic[serve]' supertonic serve --port 7788 --log-level warning &
+```
+
+First run downloads model weights; keep the working directory stable so the
+cache is reused. The server buffers whole clips (no streaming); at `steps=5`
+short replies land in ~500ms once warm.
 
 ## Tests (headless, no browser)
 
